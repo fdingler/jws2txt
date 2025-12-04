@@ -60,6 +60,9 @@ class JWSFile:
         self.x_for_last_point = data_tuple[7]
         self.x_increment = data_tuple[8]
 
+        if self.x_increment == 0:
+            self.x_increment = (self.x_for_last_point - self.x_for_first_point) / (self.npoints - 1)
+
         self.header_codes = tuple([x for i, x
                                     in enumerate(data_tuple[9:13])
                                     if x not in data_tuple[9:13][:i]])
