@@ -60,6 +60,18 @@ class JWSFile:
         self.x_for_last_point = data_tuple[7]
         self.x_increment = data_tuple[8]
 
+       
+
+        if not isinstance(self.npoints, int) or self.npoints < 2:
+            raise ValueError("Invalid npoints.")
+        
+        span = 0
+        if not self.x_increment:
+            span = self.x_for_last_point - self.x_for_first_point
+        if span == 0:
+            raise ValueError("Cannot compute x_increment: identical first/last points.")
+        
+        self.x_increment = span / (self.npoints - 1)
         self.header_codes = tuple([x for i, x
                                     in enumerate(data_tuple[9:13])
                                     if x not in data_tuple[9:13][:i]])
