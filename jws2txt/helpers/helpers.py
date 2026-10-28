@@ -92,24 +92,37 @@ class JWSFile:
             raise Exception("Y-Data not found!")
 
         y_data = file.openstream("Y-Data").read()
-
-        # data format
-        fmt = "f" * self.npoints
-
-        try:
-            self.__unpack_y_data(
-                y_data, format=fmt, num_chanels=self.numchanels
+        # Each JASCO spectrum consists of npoints float32 values. Some JWB
+        # files store scan_count * signal_count spectra (signal-major order).
+        bytes_per_spectrum = self.npoints * 4
+        if not bytes_per_spectrum or len(y_data) % bytes_per_spectrum:
+            raise ValueError("Invalid Y-Data length for float32 spectra")
+        stored_spectra = len(y_data) // bytes_per_spectrum
+        scan_count, signal_count = data_tuple[1], data_tuple[3]
+        allowed = {signal_count, scan_count, scan_count * signal_count}
+        if stored_spectra not in allowed or stored_spectra <= 0:
+            raise ValueError(
+                f"Y-Data contains {stored_spectra} spectra, but DataInfo "
+                f"declares {scan_count} scans and {signal_count} signals"
             )
-
-        except Exception:
-            try:
-                # works in the case of *.jwb file
-                self.numchanels = data_tuple[1]
-                self.__unpack_y_data(
-                    y_data, format=fmt, num_chanels=self.numchanels
+        self.numchanels = stored_spectra
+        self.__unpack_y_data(
+            y_data, format="<" + "f" * self.npoints,
+            num_chanels=stored_spectra
+        )
+        # Preserve ordinary JWS header behaviour. For multi-scan JWB,
+        # use neutral labels: DataInfo does not establish whether the
+        # independent variable is temperature, concentration, or something else.
+        if (scan_count > 1 and signal_count > 1 and
+                stored_spectra == scan_count * signal_count):
+            codes = data_tuple[10:10 + signal_count]
+            self.header_names = ["WAVELENGTH"]
+            for i in range(signal_count):
+                signal = CHANNELS_DEFINITIONS.get(
+                    codes[i], f"Signal_{i + 1}"
                 )
-            except Exception as e:
-                print(f"Incorrect number of channels. {e}")
+                for scan in range(scan_count):
+                    self.header_names.append(f"{signal}_scan{scan + 1}")
 
         sample_info = (
             file.openstream("SampleInfo").read()[8:].split(b"\x00\x00\x08\x00")
