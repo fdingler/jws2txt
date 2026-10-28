@@ -1,0 +1,483 @@
+import datetime
+import struct
+from typing import Any, Dict, List, Optional
+
+OLE_EPOCH = datetime.datetime(1899, 12, 30)
+
+
+def parse_ole_date(days: float) -> Optional[str]:
+    """Converts an OLE Automation DATE (float days since Dec 30 1899) to ISO-8601 string."""
+    try:
+        if days <= 0:
+            return None
+        dt = OLE_EPOCH + datetime.timedelta(days=days)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def parse_base_info(data: bytes) -> Dict[str, Any]:
+    """Parses BaseInfo stream containing original file path and timestamps."""
+    if len(data) < 25:
+        return {}
+    res = {}
+    try:
+        str_len = struct.unpack("<I", data[21:25])[0]
+        if 25 + str_len <= len(data):
+            orig_path = data[25 : 25 + str_len].decode("utf-16le", errors="ignore").rstrip("\x00")
+            if orig_path:
+                res["original_file"] = orig_path
+            offset = 25 + str_len
+            if offset + 16 <= len(data):
+                created_d, modified_d = struct.unpack("<dd", data[offset : offset + 16])
+                created_dt = parse_ole_date(created_d)
+                modified_dt = parse_ole_date(modified_d)
+                if created_dt:
+                    res["created"] = created_dt
+                if modified_dt:
+                    res["modified"] = modified_dt
+    except Exception:
+        pass
+    return res
+
+
+def parse_header(data: bytes) -> Dict[str, Any]:
+    """Parses Header stream containing software name, version, and platform."""
+    if len(data) < 120:
+        return {}
+    res = {}
+    try:
+        prog = data[8:40].decode("utf-16le", errors="ignore").split("\x00")[0].strip()
+        ver = data[56:88].decode("utf-16le", errors="ignore").split("\x00")[0].strip()
+        plat = data[88:120].decode("utf-16le", errors="ignore").split("\x00")[0].strip()
+        comp = data[120:152].decode("utf-16le", errors="ignore").split("\x00")[0].strip() if len(data) >= 152 else ""
+        if prog:
+            res["software"] = f"{prog} {ver}".strip() if ver else prog
+        if plat:
+            res["platform"] = plat
+        if comp:
+            res["compiler"] = comp
+    except Exception:
+        pass
+    return res
+
+
+def parse_user_info(data: bytes) -> Dict[str, Any]:
+    """Parses UserInfo stream containing operator and institution."""
+    if len(data) < 52:
+        return {}
+    try:
+        slen = struct.unpack("<I", data[48:52])[0]
+        if slen > 0 and 52 + slen <= len(data):
+            inst = data[52 : 52 + slen].decode("utf-16le", errors="ignore").rstrip("\x00").strip()
+            if inst:
+                return {"institution": inst}
+    except Exception:
+        pass
+    return {}
+
+
+def parse_module_info(data: bytes) -> Dict[str, Any]:
+    """Parses ModuleInfo stream to extract hardware model, serial, and accessories."""
+    if len(data) < 8:
+        return {}
+    strings: List[str] = []
+    idx = 4
+    while idx < len(data) - 4:
+        slen = struct.unpack("<I", data[idx : idx + 4])[0]
+        if 2 < slen <= 64 and slen % 2 == 0 and idx + 4 + slen <= len(data):
+            try:
+                raw = data[idx + 4 : idx + 4 + slen]
+                s = raw.decode("utf-16le")
+                if s.endswith("\x00"):
+                    clean = s.rstrip("\x00").strip()
+                    if clean and all(32 <= ord(c) < 127 for c in clean):
+                        strings.append(clean)
+                        idx += 4 + slen
+                        continue
+            except Exception:
+                pass
+        idx += 1
+
+    if not strings:
+        return {}
+
+    # Deduplicate consecutive identical names
+    dedup: List[str] = []
+    for s in strings:
+        if not dedup or s != dedup[-1]:
+            dedup.append(s)
+
+    res: Dict[str, Any] = {}
+    accessories: List[Dict[str, str]] = []
+    main_model: Optional[str] = None
+    main_serial: Optional[str] = None
+
+    known_prefixes = ("J-", "V-", "FP-", "PM-", "RSC-", "CDF-", "PAC-", "ETCS-", "SCE-", "V700")
+
+    i = 0
+    while i < len(dedup):
+        item = dedup[i]
+        has_next = i + 1 < len(dedup)
+        next_item = dedup[i + 1] if has_next else ""
+        next_is_serial = has_next and any(c.isdigit() for c in next_item) and not any(next_item.startswith(p) for p in known_prefixes)
+
+        if next_is_serial:
+            model_candidate = item
+            serial_candidate = next_item
+            if main_model is None:
+                # E.g. "Biochemistry CD" followed by "J-815"
+                if i + 2 < len(dedup) and any(next_item.startswith(p) for p in ("J-", "V-", "FP-")):
+                    res["system_name"] = item
+                    i += 1
+                    continue
+                main_model = model_candidate
+                main_serial = serial_candidate
+            else:
+                accessories.append({"model": model_candidate, "serial_number": serial_candidate})
+            i += 2
+        else:
+            if main_model is None and any(item.startswith(p) for p in ("J-", "V-", "FP-")):
+                main_model = item
+            elif main_model is None and "system_name" not in res:
+                res["system_name"] = item
+            i += 1
+
+    if main_model:
+        res["model"] = main_model
+    if main_serial:
+        res["serial_number"] = main_serial
+    if accessories:
+        res["accessories"] = accessories
+
+    return res
+
+
+def parse_meas_param(data: bytes) -> Dict[str, Any]:
+    """Parses MeasParam stream containing instrument parameters as typed OLE Variants."""
+    if len(data) < 12:
+        return {}
+    pos = 12
+    raw_props: Dict[int, Any] = {}
+
+    while pos + 6 <= len(data):
+        prop_id, vtype = struct.unpack("<IH", data[pos : pos + 6])
+        pos += 6
+        if vtype == 3:  # VT_I4 (int32)
+            if pos + 4 > len(data):
+                break
+            val = struct.unpack("<i", data[pos : pos + 4])[0]
+            pos += 4
+        elif vtype == 5:  # VT_R8 (double)
+            if pos + 8 > len(data):
+                break
+            val = struct.unpack("<d", data[pos : pos + 8])[0]
+            pos += 8
+        elif vtype == 7:  # VT_DATE (double date)
+            if pos + 8 > len(data):
+                break
+            val_d = struct.unpack("<d", data[pos : pos + 8])[0]
+            val = parse_ole_date(val_d)
+            pos += 8
+        elif vtype == 8:  # VT_BSTR (length-prefixed UTF-16LE)
+            if pos + 4 > len(data):
+                break
+            slen = struct.unpack("<I", data[pos : pos + 4])[0]
+            pos += 4
+            if pos + slen > len(data):
+                break
+            val = data[pos : pos + slen].decode("utf-16le", errors="ignore").rstrip("\x00").strip()
+            pos += slen
+        elif vtype == 11:  # VT_BOOL (int16 boolean)
+            if pos + 2 > len(data):
+                break
+            val = struct.unpack("<h", data[pos : pos + 2])[0] != 0
+            pos += 2
+        elif vtype == 2:  # VT_I2 (int16)
+            if pos + 2 > len(data):
+                break
+            val = struct.unpack("<h", data[pos : pos + 2])[0]
+            pos += 2
+        elif vtype == 19:  # VT_UI4 (uint32)
+            if pos + 4 > len(data):
+                break
+            val = struct.unpack("<I", data[pos : pos + 4])[0]
+            pos += 4
+        else:
+            break
+        raw_props[prop_id] = val
+
+    params: Dict[str, Any] = {}
+
+    # Sensitivity
+    for pid in (20, 88):
+        if pid in raw_props and isinstance(raw_props[pid], str) and raw_props[pid]:
+            params["sensitivity"] = raw_props[pid]
+            break
+
+    # Response time
+    for pid in (21, 9, 7):
+        if pid in raw_props and isinstance(raw_props[pid], str) and "sec" in raw_props[pid]:
+            params["response"] = raw_props[pid]
+            break
+
+    # Bandwidth
+    for pid in (24, 7, 8, 2):
+        if pid in raw_props and isinstance(raw_props[pid], str) and "nm" in raw_props[pid]:
+            params["bandwidth"] = raw_props[pid]
+            break
+
+    # Scanning speed
+    if 28 in raw_props and isinstance(raw_props[28], int) and raw_props[28] > 0:
+        params["scanning_speed"] = f"{raw_props[28]} nm/min"
+    elif 6 in raw_props and isinstance(raw_props[6], int) and raw_props[6] in (500, 1000, 2000):
+        params["scanning_speed"] = f"{raw_props[6]} nm/min"
+
+    # Pathlength
+    if 25 in raw_props and isinstance(raw_props[25], str) and raw_props[25]:
+        params["pathlength"] = raw_props[25]
+
+    # Accumulations
+    for pid in (80, 1):
+        if pid in raw_props and isinstance(raw_props[pid], int) and raw_props[pid] > 0:
+            params["accumulations"] = raw_props[pid]
+            break
+
+    # Buffer / sample notes
+    if 42 in raw_props and isinstance(raw_props[42], str) and raw_props[42]:
+        params["sample_description"] = raw_props[42]
+
+    # Start / end measurement timestamps
+    for pid in (203, 92):
+        if pid in raw_props and isinstance(raw_props[pid], str) and raw_props[pid]:
+            params["start_time"] = raw_props[pid]
+            break
+
+    for pid in (204, 190, 93, 90):
+        if pid in raw_props and isinstance(raw_props[pid], str) and raw_props[pid]:
+            params["end_time"] = raw_props[pid]
+            break
+
+    # Multi-scan temperature / thermal control
+    if 403 in raw_props and isinstance(raw_props[403], int) and raw_props[403] > 1:
+        ramp: Dict[str, Any] = {"scans": raw_props[403]}
+        if 404 in raw_props and isinstance(raw_props[404], (int, float)):
+            ramp["start_temperature"] = float(raw_props[404])
+        if 405 in raw_props and isinstance(raw_props[405], (int, float)):
+            ramp["end_temperature"] = float(raw_props[405])
+        if 410 in raw_props and isinstance(raw_props[410], (int, float)):
+            ramp["temperature_step"] = float(raw_props[410])
+        params["temperature_control"] = ramp
+
+    return params
+
+
+def extract_scan_temperatures(
+    data_info: bytes, scan_count: int, start_temp: Optional[float] = None, end_temp: Optional[float] = None
+) -> List[float]:
+    """Finds scan temperature array stored in multi-scan DataInfo streams."""
+    if scan_count <= 1 or len(data_info) < 96:
+        return []
+    for offset in range(64, len(data_info) - scan_count * 8 + 1, 4):
+        try:
+            vals = [struct.unpack("<d", data_info[offset + i * 8 : offset + (i + 1) * 8])[0] for i in range(scan_count)]
+            if all(-50 <= v <= 350 for v in vals) and len(set(vals)) == scan_count:
+                if start_temp is not None and abs(vals[0] - start_temp) > 1.5:
+                    continue
+                if end_temp is not None and abs(vals[-1] - end_temp) > 1.5:
+                    continue
+                return [round(v, 2) for v in vals]
+        except Exception:
+            pass
+    return []
+
+
+def parse_sample_info(data: bytes) -> Dict[str, str]:
+    """Parses SampleInfo stream to extract sample name and comment."""
+    if len(data) < 8:
+        return {"name": "", "comment": ""}
+    try:
+        pos = 4
+        name_len = struct.unpack("<I", data[pos : pos + 4])[0]
+        pos += 4
+        sample_name = (
+            data[pos : pos + name_len].decode("utf-16le", errors="ignore").rstrip("\x00")
+            if name_len else ""
+        )
+        pos += name_len
+        if pos + 4 <= len(data):
+            comment_len = struct.unpack("<I", data[pos : pos + 4])[0]
+            pos += 4
+            comment = (
+                data[pos : pos + comment_len].decode("utf-16le", errors="ignore").rstrip("\x00")
+                if comment_len else ""
+            )
+        else:
+            comment = ""
+        return {"name": sample_name, "comment": comment}
+    except Exception:
+        return {"name": "", "comment": ""}
+
+
+def extract_metadata(
+    ole,
+    npoints: int = 0,
+    x_first: float = 0.0,
+    x_last: float = 0.0,
+    x_increment: float = 0.0,
+    header_names: Optional[List[str]] = None,
+    scan_count: int = 1,
+) -> Dict[str, Any]:
+    """Extracts all available metadata from an open OLE file into a structured dictionary."""
+    meta: Dict[str, Any] = {}
+
+    # File information
+    if ole.exists("BaseInfo"):
+        base_info = parse_base_info(ole.openstream("BaseInfo").read())
+        if base_info:
+            meta["file_info"] = base_info
+
+    # Software / platform
+    if ole.exists("Header"):
+        hdr_info = parse_header(ole.openstream("Header").read())
+        if hdr_info:
+            meta["software"] = hdr_info
+
+    # Institution / Operator
+    if ole.exists("UserInfo"):
+        user_info = parse_user_info(ole.openstream("UserInfo").read())
+        if user_info:
+            meta["operator"] = user_info
+
+    # Instrument and accessories
+    if ole.exists("ModuleInfo"):
+        mod_info = parse_module_info(ole.openstream("ModuleInfo").read())
+        if mod_info:
+            meta["instrument"] = mod_info
+
+    # Sample info
+    sample_dict: Dict[str, Any] = {"name": "", "comment": ""}
+    if ole.exists("SampleInfo"):
+        sample_dict.update(parse_sample_info(ole.openstream("SampleInfo").read()))
+
+    # Measurement parameters
+    params: Dict[str, Any] = {}
+    if ole.exists("MeasParam"):
+        params = parse_meas_param(ole.openstream("MeasParam").read())
+        if "sample_description" in params:
+            sample_dict["description"] = params.pop("sample_description")
+
+    meta["sample"] = sample_dict
+
+    # Spectral parameters
+    spectral: Dict[str, Any] = {
+        "x_initial": x_first,
+        "x_final": x_last,
+        "x_step": x_increment,
+        "points": npoints,
+    }
+    if header_names:
+        spectral["channels"] = [h for h in header_names if not h.startswith("WAVELENGTH") and not h.startswith("TIME")]
+
+    params["spectral"] = spectral
+
+    # Multi-scan temperature array
+    temp_ctrl = params.get("temperature_control")
+    start_t = temp_ctrl.get("start_temperature") if temp_ctrl else None
+    end_t = temp_ctrl.get("end_temperature") if temp_ctrl else None
+    if scan_count > 1 and ole.exists("DataInfo"):
+        temps = extract_scan_temperatures(ole.openstream("DataInfo").read(), scan_count, start_t, end_t)
+        if temps:
+            if "temperature_control" not in params:
+                params["temperature_control"] = {"scans": scan_count}
+            params["temperature_control"]["scan_temperatures"] = temps
+
+    meta["parameters"] = params
+
+    return meta
+
+
+def format_metadata_header(metadata: Dict[str, Any]) -> List[str]:
+    """Formats metadata dictionary into human-readable commented lines for file headers."""
+    lines: List[str] = ["# --- Measurement Information ---"]
+
+    file_info = metadata.get("file_info", {})
+    if "original_file" in file_info:
+        lines.append(f"# Original File: {file_info['original_file']}")
+    if "created" in file_info:
+        lines.append(f"# Created: {file_info['created']}")
+    if "modified" in file_info:
+        lines.append(f"# Modified: {file_info['modified']}")
+
+    operator = metadata.get("operator", {})
+    if "institution" in operator:
+        lines.append(f"# Institution / Operator: {operator['institution']}")
+
+    instrument = metadata.get("instrument", {})
+    if "model" in instrument:
+        ser = f" (S/N: {instrument['serial_number']})" if "serial_number" in instrument else ""
+        lines.append(f"# Instrument: {instrument['model']}{ser}")
+    if "system_name" in instrument and instrument["system_name"] != instrument.get("model"):
+        lines.append(f"# System Name: {instrument['system_name']}")
+    if "accessories" in instrument:
+        acc_str = ", ".join(f"{a['model']} (S/N: {a.get('serial_number', 'N/A')})" for a in instrument["accessories"])
+        lines.append(f"# Accessories: {acc_str}")
+
+    software = metadata.get("software", {})
+    if "software" in software:
+        lines.append(f"# Software: {software['software']}")
+
+    sample = metadata.get("sample", {})
+    if sample.get("name"):
+        lines.append(f"# Sample Name: {sample['name']}")
+    if sample.get("comment"):
+        lines.append(f"# Sample Comment: {sample['comment']}")
+    if sample.get("description"):
+        lines.append(f"# Sample Description: {sample['description']}")
+
+    params = metadata.get("parameters", {})
+    if "sensitivity" in params:
+        lines.append(f"# Sensitivity: {params['sensitivity']}")
+    if "response" in params:
+        lines.append(f"# Response: {params['response']}")
+    if "bandwidth" in params:
+        lines.append(f"# Bandwidth: {params['bandwidth']}")
+    if "scanning_speed" in params:
+        lines.append(f"# Scanning Speed: {params['scanning_speed']}")
+    if "pathlength" in params:
+        lines.append(f"# Pathlength: {params['pathlength']}")
+    if "accumulations" in params:
+        lines.append(f"# Accumulations: {params['accumulations']}")
+
+    spectral = params.get("spectral", {})
+    if "x_initial" in spectral and "x_final" in spectral:
+        lines.append(
+            f"# Range: {spectral['x_initial']} to {spectral['x_final']} "
+            f"(Pitch: {spectral.get('x_step', 'N/A')}, Points: {spectral.get('points', 'N/A')})"
+        )
+
+    if "start_time" in params or "end_time" in params:
+        start_t = params.get("start_time", "Unknown")
+        end_t = params.get("end_time", "Unknown")
+        lines.append(f"# Measurement Time: {start_t} - {end_t}")
+
+    temp_ctrl = params.get("temperature_control", {})
+    if temp_ctrl:
+        scans = temp_ctrl.get("scans")
+        start_t = temp_ctrl.get("start_temperature")
+        end_t = temp_ctrl.get("end_temperature")
+        step_t = temp_ctrl.get("temperature_step")
+        temp_summary = []
+        if scans:
+            temp_summary.append(f"{scans} scans")
+        if start_t is not None and end_t is not None:
+            temp_summary.append(f"{start_t} °C to {end_t} °C")
+        if step_t is not None:
+            temp_summary.append(f"step {step_t} °C")
+        if temp_summary:
+            lines.append(f"# Temperature Ramp: {', '.join(temp_summary)}")
+        if "scan_temperatures" in temp_ctrl:
+            temps_str = ", ".join(f"{t}°C" for t in temp_ctrl["scan_temperatures"])
+            lines.append(f"# Scan Temperatures: {temps_str}")
+
+    return lines

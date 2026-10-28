@@ -1,8 +1,12 @@
 import csv
+import json
+import os
 from struct import unpack
-from typing import Iterator
+from typing import Any, Iterator, Optional, Union
 
 import olefile as ofio
+
+from .metadata import extract_metadata, format_metadata_header
 
 DATAINFO_FMT = "<LLLLLLdddLLLLdddd"
 
@@ -124,15 +128,19 @@ class JWSFile:
                 for scan in range(scan_count):
                     self.header_names.append(f"{signal}_scan{scan + 1}")
 
-        sample_info = (
-            file.openstream("SampleInfo").read()[8:].split(b"\x00\x00\x08\x00")
-        )  # noqa: E501
+        self.metadata = extract_metadata(
+            ole=file,
+            npoints=self.npoints,
+            x_first=self.x_for_first_point,
+            x_last=self.x_for_last_point,
+            x_increment=self.x_increment,
+            header_names=self.header_names,
+            scan_count=scan_count,
+        )
 
-        try:
-            self.__decode_sample_info(sample_info)
-        except Exception:
-            self.sample_name = ""
-            self.comment = ""
+        sample_meta = self.metadata.get("sample", {})
+        self.sample_name = sample_meta.get("name", "")
+        self.comment = sample_meta.get("comment", "")
 
         file.close()
 
@@ -158,57 +166,73 @@ class JWSFile:
         unpacked_data.insert(0, tuple(x_data))
         self.unpacked_data = unpacked_data
 
-    def __decode_sample_info(self, sample_info_bytes: list) -> None:
-        """Decodes the SampleInfo"""
-        if len(sample_info_bytes) == 2:
-            sample_name = sample_info_bytes[0].split(b"\x00\x00")[0]
-            self.sample_name = self.__unpack_sample_info(sample_name)
-
-            comment = sample_info_bytes[1].split(b"\x00\x00")[1]
-            self.comment = self.__unpack_sample_info(comment)
-
-        elif len(sample_info_bytes) == 1:
-            sample_name = sample_info_bytes[0].split(b"\x00\x00")[0]
-            self.sample_name = self.__unpack_sample_info(sample_name)
-
-            self.comment = ""
-
-    def __unpack_sample_info(self, packed_bytes: bytes) -> str:
-        """Unpacks SampleInfo bytes"""
-        if packed_bytes[-1:] not in {b"\x00", b""}:
-            packed_bytes += b"\x00"
-        format_specifier = f"{len(packed_bytes)}s"
-        unpacked_str = unpack(format_specifier, packed_bytes)[0].decode(
-            "utf16"
-        )
-        return unpacked_str
-
     def write_data(
         self,
-        out_file: str,
+        out_file: Union[str, os.PathLike, Any],
         write_comments: bool = True,
         write_header: bool = True,
         delimiter: str = "\t",
+        metadata: Union[str, bool] = False,
+        json_path: Optional[str] = None,
     ) -> None:
-        values = zip(*self.unpacked_data)
-        try:
-            with open(out_file, "x", newline="") as f:
-                writer = csv.writer(f, delimiter=delimiter)
+        """Writes spectral data to a text file and optionally writes metadata.
 
-                if write_comments is True:
-                    writer.writerow([self.sample_name])
-                    writer.writerow([self.comment])
+        Args:
+            out_file: Target file path or writable stream.
+            write_comments: Write sample name and comment rows (default True).
+            write_header: Write column header row (default True).
+            delimiter: Column delimiter (default tab).
+            metadata: Metadata output mode: 'header' (prefixed comment lines at top of file),
+                      'json' (companion sidecar json file), 'both' (both header and json),
+                      or False/'none' (default, no metadata).
+            json_path: Explicit path for the metadata JSON file (if json output requested).
+        """
+        values = list(zip(*self.unpacked_data))
 
-                if write_header is True:
-                    if len(self.header_names) == len(self.unpacked_data):
-                        writer.writerow(self.header_names)
-                    elif len(self.header_names) < len(self.unpacked_data):
-                        diff = len(self.unpacked_data) - len(self.header_names)
-                        self.header_names.extend(
-                            [self.header_names[-1]] * diff
-                        )
-                        writer.writerow(self.header_names)
+        meta_mode = str(metadata).strip().lower()
+        write_meta_header = meta_mode in ("header", "both", "true")
+        write_meta_json = meta_mode in ("json", "both")
 
-                writer.writerows(values)
-        except FileExistsError:
-            print(f"Error: File '{out_file}' already exists.")
+        def _write_content(writer):
+            if write_meta_header:
+                for line in format_metadata_header(self.metadata):
+                    writer.writerow([line])
+
+            if write_comments is True:
+                writer.writerow([self.sample_name])
+                writer.writerow([self.comment])
+
+            if write_header is True:
+                if len(self.header_names) == len(self.unpacked_data):
+                    writer.writerow(self.header_names)
+                elif len(self.header_names) < len(self.unpacked_data):
+                    diff = len(self.unpacked_data) - len(self.header_names)
+                    self.header_names.extend(
+                        [self.header_names[-1]] * diff
+                    )
+                    writer.writerow(self.header_names)
+
+            writer.writerows(values)
+
+        if hasattr(out_file, "write"):
+            writer = csv.writer(out_file, delimiter=delimiter)
+            _write_content(writer)
+        else:
+            try:
+                with open(out_file, "x", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f, delimiter=delimiter)
+                    _write_content(writer)
+            except FileExistsError:
+                print(f"Error: File '{out_file}' already exists.")
+
+        if write_meta_json:
+            target_json = json_path
+            if not target_json and isinstance(out_file, (str, os.PathLike)):
+                target_json = os.path.splitext(out_file)[0] + ".json"
+            if target_json:
+                self.write_metadata_json(target_json)
+
+    def write_metadata_json(self, out_file: str, indent: int = 2) -> None:
+        """Writes metadata as a JSON file."""
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(self.metadata, f, indent=indent, ensure_ascii=False)

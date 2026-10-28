@@ -26,18 +26,39 @@ def main():
     parser.add_argument('--comments', type=str2bool, choices=[True, False], default=True,  # noqa: E501
                          help='Write sample information.')
     parser.add_argument('--header', type=str2bool, choices=[True, False], default=True,
-                         help='Write header.')
+                         help='Write column headers.')
+    parser.add_argument('--metadata', type=str, default='none',
+                         choices=['none', 'header', 'json', 'both', 'false', 'true', 'False', 'True'],
+                         help="Metadata output mode: 'header' (top comment lines), 'json' (sidecar file), 'both', or 'none'.")
 
     args = parser.parse_args()
 
     if not os.path.exists(args.in_path):
         raise FileNotFoundError(f"{args.in_path} does not exist.")
 
+    if os.path.isfile(args.in_path):
+        out_dir = args.out_dir if args.out_dir else os.path.dirname(args.in_path)
+        if not out_dir:
+            out_dir = "."
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        out_file_path = os.path.join(
+            out_dir, os.path.splitext(os.path.basename(args.in_path))[0] + ".txt"
+        )
+        JWSFile(path=args.in_path).write_data(
+            out_file=out_file_path,
+            delimiter=args.delimiter,
+            write_comments=args.comments,
+            write_header=args.header,
+            metadata=args.metadata,
+        )
+        return
+
     if args.out_dir is None:
         args.out_dir = args.in_path
 
     if not os.path.exists(args.out_dir):
-        os.mkdir(args.out_dir)
+        os.makedirs(args.out_dir, exist_ok=True)
 
     for (root, dirs, files) in os.walk(args.in_path, topdown=True):
         gen = (file for file in files if file.endswith(('.jwb', '.jws')))
@@ -51,7 +72,8 @@ def main():
             JWSFile(path=jws_file_path).write_data(out_file=out_file_path,
                                                    delimiter=args.delimiter,
                                                    write_comments=args.comments,
-                                                   write_header=args.header)
+                                                   write_header=args.header,
+                                                   metadata=args.metadata)
       
 
 if __name__ == '__main__':
