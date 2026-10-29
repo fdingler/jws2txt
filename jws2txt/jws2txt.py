@@ -14,6 +14,23 @@ def str2bool(v: str) -> bool:
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
+def parse_metadata_mode(v: str) -> str:
+    """Parses and normalizes metadata output mode (case-insensitive)."""
+    s = str(v).strip().lower()
+    if s in ('none', 'false', 'f', 'no', '0'):
+        return 'none'
+    elif s in ('header', 'head'):
+        return 'header'
+    elif s in ('json', 'sidecar'):
+        return 'json'
+    elif s in ('both', 'all', 'true', 't', 'yes', '1'):
+        return 'both'
+    else:
+        raise argparse.ArgumentTypeError(
+            f"Invalid metadata mode: {v!r}. Choose from 'none', 'header', 'json', or 'both'."
+        )
+
 def main():
     
     parser = argparse.ArgumentParser(description='Converts *.jws or *jwb files to human\
@@ -27,9 +44,8 @@ def main():
                          help='Write sample information.')
     parser.add_argument('--header', type=str2bool, choices=[True, False], default=True,
                          help='Write column headers.')
-    parser.add_argument('--metadata', type=str, default='none',
-                         choices=['none', 'header', 'json', 'both', 'false', 'true', 'False', 'True'],
-                         help="Metadata output mode: 'header' (top comment lines), 'json' (sidecar file), 'both', or 'none'.")
+    parser.add_argument('--metadata', type=parse_metadata_mode, default='none', metavar='MODE',
+                         help="Metadata export: 'none' (default), 'header' (top comment lines in text file), 'json' (sidecar file), or 'both'.")
 
     args = parser.parse_args()
 

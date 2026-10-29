@@ -1,4 +1,5 @@
 import datetime
+import re
 import struct
 from typing import Any, Dict, List, Optional
 
@@ -221,11 +222,29 @@ def parse_meas_param(data: bytes) -> Dict[str, Any]:
             params["response"] = raw_props[pid]
             break
 
-    # Bandwidth
-    for pid in (24, 7, 8, 2):
-        if pid in raw_props and isinstance(raw_props[pid], str) and "nm" in raw_props[pid]:
-            params["bandwidth"] = raw_props[pid]
-            break
+    # Bandwidth (dual EX/EM for spectrofluorometers, or single bandwidth)
+    if (
+        2 in raw_props
+        and 4 in raw_props
+        and isinstance(raw_props[2], str)
+        and isinstance(raw_props[4], str)
+        and "nm" in raw_props[2]
+        and "nm" in raw_props[4]
+    ):
+        params["ex_bandwidth"] = raw_props[2]
+        params["em_bandwidth"] = raw_props[4]
+        params["bandwidth"] = f"EX {raw_props[2]}, EM {raw_props[4]}"
+    else:
+        for pid in (24, 7, 8, 2):
+            if pid in raw_props and isinstance(raw_props[pid], str) and "nm" in raw_props[pid]:
+                params["bandwidth"] = raw_props[pid]
+                break
+
+    # Fixed excitation wavelength (for 2D fluorescence emission scans)
+    if raw_props.get(1) == 1 and 9 in raw_props:
+        v9 = raw_props[9]
+        if isinstance(v9, (int, float)) and v9 > 0:
+            params["excitation_wavelength"] = f"{float(v9):g} nm"
 
     # Scanning speed
     if 28 in raw_props and isinstance(raw_props[28], int) and raw_props[28] > 0:
@@ -237,11 +256,25 @@ def parse_meas_param(data: bytes) -> Dict[str, Any]:
     if 25 in raw_props and isinstance(raw_props[25], str) and raw_props[25]:
         params["pathlength"] = raw_props[25]
 
-    # Accumulations
-    for pid in (80, 1):
+    # Accumulations (Prop 202 is true measurement count, 80 and 1 are fallback flags)
+    for pid in (202, 80, 1):
         if pid in raw_props and isinstance(raw_props[pid], int) and raw_props[pid] > 0:
             params["accumulations"] = raw_props[pid]
             break
+
+    # Scanning mode (0: Continuous, 1: Step)
+    if 26 in raw_props and isinstance(raw_props[26], int):
+        params["scanning_mode"] = "Step" if raw_props[26] == 1 else "Continuous"
+
+    # Baseline correction
+    if raw_props.get(120) == 2 or raw_props.get(121) == 1:
+        params["baseline_correction"] = "Baseline"
+
+    # CD detector and PMT voltage
+    if raw_props.get(122) == 5:
+        params["cd_detector"] = "PMT"
+    if raw_props.get(103) == 20:
+        params["pmt_voltage"] = "Auto"
 
     # Buffer / sample notes
     if 42 in raw_props and isinstance(raw_props[42], str) and raw_props[42]:
@@ -265,8 +298,20 @@ def parse_meas_param(data: bytes) -> Dict[str, Any]:
             ramp["start_temperature"] = float(raw_props[404])
         if 405 in raw_props and isinstance(raw_props[405], (int, float)):
             ramp["end_temperature"] = float(raw_props[405])
+        if 402 in raw_props and isinstance(raw_props[402], (int, float)):
+            ramp["temperature_step"] = float(raw_props[402])
         if 410 in raw_props and isinstance(raw_props[410], (int, float)):
-            ramp["temperature_step"] = float(raw_props[410])
+            ramp["heating_rate"] = float(raw_props[410])
+        for t_pid in (861, 662):
+            if t_pid in raw_props and isinstance(raw_props[t_pid], (int, float)):
+                ramp["temperature_tolerance"] = float(raw_props[t_pid])
+                break
+        for w_pid in (803, 603):
+            if w_pid in raw_props and isinstance(raw_props[w_pid], (int, float)):
+                ramp["stabilization_time"] = float(raw_props[w_pid])
+                break
+        if 401 in raw_props and isinstance(raw_props[401], (int, float)):
+            ramp["post_run_temperature"] = float(raw_props[401])
         params["temperature_control"] = ramp
 
     return params
@@ -377,16 +422,49 @@ def extract_metadata(
         "points": npoints,
     }
     if header_names:
-        spectral["channels"] = [h for h in header_names if not h.startswith("WAVELENGTH") and not h.startswith("TIME")]
+        raw_channels = [h for h in header_names if not h.startswith("WAVELENGTH") and not h.startswith("TIME")]
+        spectral["channels"] = raw_channels
+        unique_channels: List[str] = []
+        for ch in raw_channels:
+            base_ch = re.sub(r"_scan\d+$", "", ch)
+            if base_ch not in unique_channels:
+                unique_channels.append(base_ch)
+        if unique_channels:
+            params["photometric_mode"] = ", ".join(unique_channels)
 
     params["spectral"] = spectral
 
-    # Multi-scan temperature array
-    temp_ctrl = params.get("temperature_control")
-    start_t = temp_ctrl.get("start_temperature") if temp_ctrl else None
-    end_t = temp_ctrl.get("end_temperature") if temp_ctrl else None
+    # Multi-scan temperature array or 3D spectral scan
     if scan_count > 1 and ole.exists("DataInfo"):
-        temps = extract_scan_temperatures(ole.openstream("DataInfo").read(), scan_count, start_t, end_t)
+        data_info_bytes = ole.openstream("DataInfo").read()
+
+        # Check for 3D spectral scan (secondary dimension in DataInfo)
+        if len(data_info_bytes) >= 92:
+            sec_pts = struct.unpack("<I", data_info_bytes[60:64])[0]
+            sec_start, sec_end, sec_step = struct.unpack("<ddd", data_info_bytes[64:88])
+            sec_code = struct.unpack("<I", data_info_bytes[88:92])[0]
+            if sec_pts == scan_count and sec_code == 268435715 and sec_step > 0:
+                em_wavelengths = [round(sec_start + i * sec_step, 4) for i in range(sec_pts)]
+                params["three_dimensional_scan"] = {
+                    "dimension": "Emission Wavelength",
+                    "scans": sec_pts,
+                    "start_wavelength": sec_start,
+                    "end_wavelength": sec_end,
+                    "wavelength_step": sec_step,
+                    "scan_emission_wavelengths": em_wavelengths,
+                }
+                spectral["secondary_dimension"] = {
+                    "name": "Emission Wavelength",
+                    "x_initial": sec_start,
+                    "x_final": sec_end,
+                    "x_step": sec_step,
+                    "points": sec_pts,
+                }
+
+        temp_ctrl = params.get("temperature_control")
+        start_t = temp_ctrl.get("start_temperature") if temp_ctrl else None
+        end_t = temp_ctrl.get("end_temperature") if temp_ctrl else None
+        temps = extract_scan_temperatures(data_info_bytes, scan_count, start_t, end_t)
         if temps:
             if "temperature_control" not in params:
                 params["temperature_control"] = {"scans": scan_count}
@@ -436,23 +514,37 @@ def format_metadata_header(metadata: Dict[str, Any]) -> List[str]:
         lines.append(f"# Sample Description: {sample['description']}")
 
     params = metadata.get("parameters", {})
-    if "sensitivity" in params:
-        lines.append(f"# Sensitivity: {params['sensitivity']}")
-    if "response" in params:
-        lines.append(f"# Response: {params['response']}")
-    if "bandwidth" in params:
-        lines.append(f"# Bandwidth: {params['bandwidth']}")
+    if "photometric_mode" in params:
+        lines.append(f"# Photometric Mode: {params['photometric_mode']}")
+    if "scanning_mode" in params:
+        lines.append(f"# Scanning Mode: {params['scanning_mode']}")
     if "scanning_speed" in params:
         lines.append(f"# Scanning Speed: {params['scanning_speed']}")
+    if "response" in params:
+        lines.append(f"# D.I.T. (Response): {params['response']}")
+    if "bandwidth" in params:
+        lines.append(f"# Bandwidth: {params['bandwidth']}")
+    if "excitation_wavelength" in params:
+        lines.append(f"# Excitation Wavelength: {params['excitation_wavelength']}")
+    if "sensitivity" in params:
+        lines.append(f"# Sensitivity: {params['sensitivity']}")
     if "pathlength" in params:
         lines.append(f"# Pathlength: {params['pathlength']}")
     if "accumulations" in params:
         lines.append(f"# Accumulations: {params['accumulations']}")
+    if "baseline_correction" in params:
+        lines.append(f"# Baseline Correction: {params['baseline_correction']}")
+    if "cd_detector" in params or "pmt_voltage" in params:
+        det = params.get("cd_detector", "")
+        volt = f" (PMT Voltage: {params['pmt_voltage']})" if "pmt_voltage" in params else ""
+        lines.append(f"# CD Detector: {det}{volt}".strip())
 
     spectral = params.get("spectral", {})
+    three_d = params.get("three_dimensional_scan", {})
+    range_label = "# Range (Excitation)" if three_d else "# Range"
     if "x_initial" in spectral and "x_final" in spectral:
         lines.append(
-            f"# Range: {spectral['x_initial']} to {spectral['x_final']} "
+            f"{range_label}: {spectral['x_initial']} to {spectral['x_final']} "
             f"(Pitch: {spectral.get('x_step', 'N/A')}, Points: {spectral.get('points', 'N/A')})"
         )
 
@@ -461,21 +553,58 @@ def format_metadata_header(metadata: Dict[str, Any]) -> List[str]:
         end_t = params.get("end_time", "Unknown")
         lines.append(f"# Measurement Time: {start_t} - {end_t}")
 
+    if three_d:
+        scans = three_d.get("scans")
+        start_w = three_d.get("start_wavelength")
+        end_w = three_d.get("end_wavelength")
+        step_w = three_d.get("wavelength_step")
+        dim = three_d.get("dimension", "Emission Wavelength")
+        summary = f"{scans} scans" if scans else ""
+        if start_w is not None and end_w is not None:
+            summary += f", {dim} {start_w} nm to {end_w} nm" if summary else f"{dim} {start_w} nm to {end_w} nm"
+        if step_w is not None:
+            summary += f" (step {step_w} nm)"
+        if summary:
+            lines.append(f"# 3D Scan: {summary}")
+        em_vals = three_d.get("scan_emission_wavelengths", [])
+        if em_vals:
+            em_str = ", ".join(f"{w:g} nm" for w in em_vals)
+            lines.append(f"# Emission Wavelengths: {em_str}")
+
     temp_ctrl = params.get("temperature_control", {})
     if temp_ctrl:
         scans = temp_ctrl.get("scans")
         start_t = temp_ctrl.get("start_temperature")
         end_t = temp_ctrl.get("end_temperature")
         step_t = temp_ctrl.get("temperature_step")
-        temp_summary = []
-        if scans:
-            temp_summary.append(f"{scans} scans")
-        if start_t is not None and end_t is not None:
-            temp_summary.append(f"{start_t} °C to {end_t} °C")
+        rate_t = temp_ctrl.get("heating_rate")
+        tol_t = temp_ctrl.get("temperature_tolerance")
+        wait_t = temp_ctrl.get("stabilization_time")
+        post_t = temp_ctrl.get("post_run_temperature")
+
+        details = []
         if step_t is not None:
-            temp_summary.append(f"step {step_t} °C")
-        if temp_summary:
-            lines.append(f"# Temperature Ramp: {', '.join(temp_summary)}")
+            details.append(f"step {step_t} °C")
+        if rate_t is not None:
+            details.append(f"rate {rate_t} °C/min")
+        if tol_t is not None and wait_t is not None:
+            w_disp = int(wait_t) if isinstance(wait_t, float) and wait_t.is_integer() else wait_t
+            details.append(f"tolerance ±{tol_t} °C for {w_disp} s")
+        elif tol_t is not None:
+            details.append(f"tolerance ±{tol_t} °C")
+        elif wait_t is not None:
+            w_disp = int(wait_t) if isinstance(wait_t, float) and wait_t.is_integer() else wait_t
+            details.append(f"wait {w_disp} s")
+        if post_t is not None:
+            details.append(f"post-run {post_t} °C")
+
+        ramp_str = f"{scans} scans" if scans else ""
+        if start_t is not None and end_t is not None:
+            ramp_str += f", {start_t} °C to {end_t} °C" if ramp_str else f"{start_t} °C to {end_t} °C"
+        if details:
+            ramp_str += f" ({', '.join(details)})"
+        if ramp_str:
+            lines.append(f"# Temperature Ramp: {ramp_str}")
         if "scan_temperatures" in temp_ctrl:
             temps_str = ", ".join(f"{t}°C" for t in temp_ctrl["scan_temperatures"])
             lines.append(f"# Scan Temperatures: {temps_str}")

@@ -93,8 +93,10 @@ class JWSFileTest(unittest.TestCase):
         self.assertEqual(self.jwb_file.x_for_last_point, 400.0)
         self.assertEqual(self.jwb_file.x_increment, -0.5)
         self.assertEqual(self.jwb_file.header_codes, (268435715, 3, 0, 8))
-        self.assertEqual(self.jwb_file.header_names, ['WAVELENGTH', 'ABSORBANCE',
-                                                       'undefined', 'undefined'])
+        self.assertEqual(
+            self.jwb_file.header_names,
+            ['WAVELENGTH'] + [f'ABSORBANCE_scan{i}' for i in range(1, 9)]
+        )
         self.assertEqual(self.jwb_file.data_list, [3,
                                                     8,
                                                     1,

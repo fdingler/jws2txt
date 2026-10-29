@@ -117,8 +117,7 @@ class JWSFile:
         # Preserve ordinary JWS header behaviour. For multi-scan JWB,
         # use neutral labels: DataInfo does not establish whether the
         # independent variable is temperature, concentration, or something else.
-        if (scan_count > 1 and signal_count > 1 and
-                stored_spectra == scan_count * signal_count):
+        if scan_count > 1 and stored_spectra == scan_count * signal_count:
             codes = data_tuple[10:10 + signal_count]
             self.header_names = ["WAVELENGTH"]
             for i in range(signal_count):
@@ -190,8 +189,8 @@ class JWSFile:
         values = list(zip(*self.unpacked_data))
 
         meta_mode = str(metadata).strip().lower()
-        write_meta_header = meta_mode in ("header", "both", "true")
-        write_meta_json = meta_mode in ("json", "both")
+        write_meta_header = meta_mode in ("header", "both", "true", "1", "yes", "t")
+        write_meta_json = meta_mode in ("json", "both", "true", "1", "yes", "t")
 
         def _write_content(writer):
             if write_meta_header:
